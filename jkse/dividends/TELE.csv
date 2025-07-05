@@ -1,0 +1,8 @@
+ex_date,dividend,payment_date,fiscal_year,dividend_type
+2019-07-08,6,2019-07-31,2018,final
+2018-04-17,5,,2018,interim
+2018-04-13,5,2018-05-07,2017,final
+2017-07-04,16,2017-07-18,2016,final
+2016-06-23,13,,2015,final
+2015-05-29,10,,2014,final
+2013-07-16,9,,2012,final
