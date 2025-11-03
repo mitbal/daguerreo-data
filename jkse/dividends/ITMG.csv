@@ -21,8 +21,7 @@ ex_date,dividend,payment_date,fiscal_year,dividend_type
 2015-10-09,752.0,,2015,interim
 2015-04-09,645.0,,2014,final
 2014-10-30,1100.0,,2014,interim
-2014-04-29,975.0,,2014,interim
-2014-03-28,975.0,,2013,final
+2014-04-29,975.0,,2013,final
 2013-10-30,1014.0,,2013,interim
 2013-04-29,1464.0,,2012,final
 2012-10-30,1666.0,,2012,interim
