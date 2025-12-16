@@ -1,4 +1,5 @@
 ex_date,dividend,payment_date,fiscal_year,dividend_type
+2025-12-23,17.0,2026-01-14,2025,interim
 2025-06-26,15.0,2025-07-18,2024,final
 2025-01-02,15.0,2025-01-17,2024,interim
 2024-07-08,50.0,2024-07-18,2023,final
