@@ -185,6 +185,32 @@ def _dividend_per_share_after_label(text: str) -> Decimal | None:
         if stop_positions:
             fragment = fragment[:min(stop_positions)]
 
+        # IDX's newer schedule template states the confirmed per-share amount
+        # before a separate section containing the total payout. In that layout
+        # the later total must never overwrite the explicitly confirmed amount.
+        confirmation_positions = [
+            position for marker in (
+                "dividen per saham sudah ditentukan",
+                "dividend per share has been determined",
+            )
+            if (position := fragment.lower().find(marker)) > 0
+        ]
+        if confirmation_positions:
+            confirmed_amounts: list[Decimal] = []
+            for line in fragment[:min(confirmation_positions)].splitlines():
+                money_matches = re.findall(
+                    r"(?:IDR|Rp\.?)\s*([0-9][0-9.,]*)",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+                raw_values = money_matches or re.findall(r"^\s*([0-9][0-9.,]*)\s*$", line)
+                for raw_value in raw_values:
+                    amount = _decimal_from_idx_text(raw_value)
+                    if amount is not None:
+                        confirmed_amounts.append(amount)
+            if confirmed_amounts:
+                return confirmed_amounts[-1]
+
         # In some IDX PDFs, PyMuPDF emits a total payout and the per-share
         # value after the same label: IDR, IDR, total payout, per-share value.
         # Consume the nearby amount-bearing lines in source order and take the
@@ -252,24 +278,42 @@ def _event_from_dividend_schedule(ticker: str, schedule_text: str) -> dict[str, 
 def _announcement_dividend_events(session: Any, impersonate: str) -> list[dict[str, str]]:
     """Extract recent cash-dividend schedules from official IDX disclosures."""
     today = date.today()
+    params = {
+        "keywords": "",
+        "pageSize": 1000,
+        "dateFrom": (today - timedelta(days=ANNOUNCEMENT_LOOKBACK_DAYS)).strftime("%Y%m%d"),
+        "dateTo": today.strftime("%Y%m%d"),
+        "lang": "en",
+    }
     response = session.get(
         ANNOUNCEMENT_API_URL,
-        params={
-            "keywords": "",
-            "pageNumber": 1,
-            "pageSize": 1000,
-            "dateFrom": (today - timedelta(days=ANNOUNCEMENT_LOOKBACK_DAYS)).strftime("%Y%m%d"),
-            "dateTo": today.strftime("%Y%m%d"),
-            "lang": "en",
-        },
+        params={**params, "pageNumber": 1},
         impersonate=impersonate,
         timeout=30,
     )
     if response.status_code != 200:
         raise RuntimeError(f"announcement API HTTP {response.status_code}")
-    announcements = response.json().get("Items", [])
+    first_page = response.json()
+    announcements = first_page.get("Items", [])
     if not isinstance(announcements, list):
         raise RuntimeError("announcement API returned a non-list Items field")
+
+    # The API caps each response at 1,000 rows. Dividend notices can land on a
+    # later page during busy disclosure windows, so inspect every page in the
+    # bounded rolling lookback instead of silently treating page one as complete.
+    for page_number in range(2, int(first_page.get("PageCount") or 1) + 1):
+        response = session.get(
+            ANNOUNCEMENT_API_URL,
+            params={**params, "pageNumber": page_number},
+            impersonate=impersonate,
+            timeout=30,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"announcement API page {page_number} HTTP {response.status_code}")
+        page_items = response.json().get("Items", [])
+        if not isinstance(page_items, list):
+            raise RuntimeError(f"announcement API page {page_number} returned a non-list Items field")
+        announcements.extend(page_items)
 
     import fitz
 
