@@ -5,10 +5,18 @@ import csv
 import sys
 import tempfile
 import unittest
+from datetime import date, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from idx_dividend_sync import _event_from_dividend_schedule, execute, fetch_cash_events, sync_cash_events
+from idx_dividend_sync import (
+    PENDING_USD_PATH,
+    _event_from_dividend_schedule,
+    execute,
+    fetch_cash_events,
+    sync_cash_events,
+)
 
 
 class SyncCashEventsTests(unittest.TestCase):
@@ -162,7 +170,7 @@ class SyncCashEventsTests(unittest.TestCase):
 
             self.assertEqual(
                 result,
-                {"source_rows": 1, "added": 1, "updated": 0, "skipped": 0, "files": ["TEST.csv"]},
+                {"source_rows": 1, "added": 1, "updated": 0, "skipped": 0, "files": ["TEST.csv"], "pending_usd": []},
             )
 
     def test_dividend_schedule_uses_per_share_amount_not_total_payout(self):
@@ -239,6 +247,163 @@ Tanggal Pembayaran Dividen
         event = _event_from_dividend_schedule("BMRI", schedule_text)
 
         self.assertEqual(event["cashDividend"], "66")
+
+    def test_dividend_schedule_picks_per_share_between_min_and_max_totals(self):
+        # UNTR layout: the confirmation marker shares the label prefix and the
+        # per-share cell sits between the minimum and maximum total payouts.
+        schedule_text = """Dividen Tunai Interim
+Perseroan menyampaikan rencana pembagian Dividen Interim untuk periode tahun buku 2026
+Dividen per saham sudah ditentukan
+Efek Bersifat Ekuitas selain saham yg bisa dikonversi menjadi saham
+Total Nilai Dividen sekurang-kurangnya
+Dividen per saham
+1.478.191.622.480
+IDR
+Tidak
+430
+IDR
+IDR
+1.459.597.313.471
+Total Nilai Dividen setinggi-tingginya
+Jadwal pembagian dividen:
+Tanggal Daftar Pemegang Saham (DPS) yang berhak atas dividen tunai
+Tanggal Cum Dividen di Pasar Reguler dan Pasar Negosiasi
+Tanggal Ex Dividen di Pasar Reguler dan Pasar Negosiasi
+Tanggal Cum Dividen di Pasar Tunai
+Tanggal Ex Dividen di Pasar Tunai
+Tanggal Pembayaran Dividen
+08 Oktober 2026
+06 Oktober 2026
+07 Oktober 2026
+08 Oktober 2026
+09 Oktober 2026
+26 Oktober 2026
+"""
+
+        event = _event_from_dividend_schedule("UNTR", schedule_text)
+
+        self.assertEqual(event["cashDividend"], "430")
+        self.assertEqual(event["exDividend"], "2026-10-07")
+
+    def test_dividend_schedule_reads_comma_as_decimal_mark(self):
+        for raw, expected in (("406,1609", "406.1609"), ("1,422181", "1.422181"), ("12,5", "12.5")):
+            schedule_text = f"""Dividen Tunai Interim
+Perseroan menyampaikan rencana pembagian Dividen Interim untuk periode tahun buku 2026
+Dividen Per Saham (Jika sudah ada kepastian jumlah saham yang akan
+dibagi)
+IDR
+{raw}
+Jadwal pembagian dividen:
+Tanggal Daftar Pemegang Saham (DPS) yang berhak atas dividen tunai
+Tanggal Cum Dividen di Pasar Reguler dan Pasar Negosiasi
+Tanggal Ex Dividen di Pasar Reguler dan Pasar Negosiasi
+Tanggal Cum Dividen di Pasar Tunai
+Tanggal Ex Dividen di Pasar Tunai
+Tanggal Pembayaran Dividen
+08 Oktober 2026
+06 Oktober 2026
+07 Oktober 2026
+08 Oktober 2026
+09 Oktober 2026
+26 Oktober 2026
+"""
+            with self.subTest(raw=raw):
+                self.assertEqual(_event_from_dividend_schedule("BSSR", schedule_text)["cashDividend"], expected)
+
+    def test_dividend_schedule_marks_sub_unit_usd_per_share_amount(self):
+        schedule_text = """Dividen Tunai Interim
+Perseroan menyampaikan rencana pembagian Dividen Interim untuk periode tahun buku 2026
+Dividen Per Saham (Jika sudah ada kepastian jumlah saham yang akan
+dibagi)
+USD
+0,034
+Jadwal pembagian dividen:
+Tanggal Daftar Pemegang Saham (DPS) yang berhak atas dividen tunai
+Tanggal Cum Dividen di Pasar Reguler dan Pasar Negosiasi
+Tanggal Ex Dividen di Pasar Reguler dan Pasar Negosiasi
+Tanggal Cum Dividen di Pasar Tunai
+Tanggal Ex Dividen di Pasar Tunai
+Tanggal Pembayaran Dividen
+08 Oktober 2026
+06 Oktober 2026
+07 Oktober 2026
+08 Oktober 2026
+09 Oktober 2026
+26 Oktober 2026
+"""
+
+        event = _event_from_dividend_schedule("GEMS", schedule_text)
+
+        self.assertEqual(event["usdDividend"], "0.034")
+        self.assertNotIn("cashDividend", event)
+
+    def test_usd_event_is_written_with_ksei_idr_amount(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            event = {
+                "code": "GEMS",
+                "usdDividend": "0.034",
+                "exDividend": "2026-10-09",
+                "paymentDate": "2026-10-22",
+                "note": "I",
+                "fiscalYear": "2026",
+            }
+            lookups = []
+
+            def idr_lookup(ticker, payment_date):
+                lookups.append((ticker, payment_date))
+                return Decimal("611.93")
+
+            result = execute(repo, lambda: [event], idr_lookup)
+
+            self.assertEqual(lookups, [("GEMS", "2026-10-22")])
+            self.assertEqual(result["pending_usd"], [])
+            self.assertEqual(
+                (repo / "jkse" / "dividends" / "GEMS.csv").read_text().splitlines()[1],
+                "2026-10-09,611.93,2026-10-22,2026,interim",
+            )
+            self.assertFalse((repo / PENDING_USD_PATH).exists())
+
+    def test_unresolved_usd_event_is_retried_after_announcement_leaves_lookback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            payment_date = (date.today() + timedelta(days=10)).isoformat()
+            event = {
+                "code": "GEMS",
+                "usdDividend": "0.034",
+                "exDividend": "2026-10-09",
+                "paymentDate": payment_date,
+                "note": "I",
+            }
+
+            first = execute(repo, lambda: [event], lambda ticker, payment: None)
+            self.assertEqual(first["added"], 0)
+            self.assertEqual(first["pending_usd"], [event])
+            self.assertFalse((repo / "jkse" / "dividends" / "GEMS.csv").exists())
+
+            # The announcement is gone from the IDX lookback on the next run.
+            second = execute(repo, lambda: [], lambda ticker, payment: Decimal("611.93"))
+
+            self.assertEqual(second["added"], 1)
+            self.assertEqual(second["pending_usd"], [])
+            self.assertIn("2026-10-09,611.93,", (repo / "jkse" / "dividends" / "GEMS.csv").read_text())
+            self.assertFalse((repo / PENDING_USD_PATH).exists())
+
+    def test_unresolved_usd_event_is_dropped_after_grace_period(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            event = {
+                "code": "GEMS",
+                "usdDividend": "0.034",
+                "exDividend": "2025-01-09",
+                "paymentDate": "2025-01-22",
+                "note": "I",
+            }
+
+            result = execute(repo, lambda: [event], lambda ticker, payment: None)
+
+            self.assertEqual(result["pending_usd"], [])
+            self.assertFalse((repo / PENDING_USD_PATH).exists())
 
     def test_fetch_discovers_interim_dividend_from_official_announcement_when_statistics_feed_is_empty(self):
         import fitz

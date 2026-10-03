@@ -27,6 +27,10 @@ IDX_HOME = "https://www.idx.co.id/en"
 CASH_API_URL = "https://www.idx.co.id/primary/DigitalStatistic/GetApiDataPaginated"
 ANNOUNCEMENT_API_URL = "https://www.idx.co.id/primary/NewsAnnouncement/GetAllAnnouncement"
 ANNOUNCEMENT_LOOKBACK_DAYS = 7
+KSEI_CORPORATE_ACTIONS_URL = "https://www.ksei.co.id/api/corporate_actions"
+PENDING_USD_PATH = Path("automation") / "idx-dividend-sync" / "state" / "pending_usd_dividends.json"
+# Give KSEI this long after the payment date to publish the IDR equivalent.
+PENDING_USD_GRACE_DAYS = 30
 DATE_PATTERN = re.compile(r"\b(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\b")
 FISCAL_YEAR_PATTERN = re.compile(
     r"(?:tahun\s+buku|fiscal(?:\s+year)?|financial\s+year)\s+(\d{4})",
@@ -148,8 +152,13 @@ def _decimal_from_idx_text(value: str) -> Decimal | None:
         thousands_separator = "." if decimal_separator == "," else ","
         compact = compact.replace(thousands_separator, "").replace(decimal_separator, ".")
     elif "," in compact:
-        suffix = compact.rsplit(",", 1)[1]
-        compact = compact.replace(",", ".") if len(suffix) <= 2 else compact.replace(",", "")
+        # IDX notices use Indonesian formatting ("." thousands, "," decimal), so a
+        # single comma is a decimal mark even with 3+ fraction digits (0,034;
+        # 406,1609). Only repeated 3-digit comma groups read as thousands.
+        if compact.count(",") > 1 and re.fullmatch(r"\d{1,3}(?:,\d{3})+", compact):
+            compact = compact.replace(",", "")
+        else:
+            compact = compact.replace(",", ".")
     elif "." in compact and len(compact.rsplit(".", 1)[1]) == 3:
         compact = compact.replace(".", "")
     try:
@@ -211,10 +220,10 @@ def _dividend_per_share_after_label(text: str) -> Decimal | None:
             if confirmed_amounts:
                 return confirmed_amounts[-1]
 
-        # In some IDX PDFs, PyMuPDF emits a total payout and the per-share
-        # value after the same label: IDR, IDR, total payout, per-share value.
-        # Consume the nearby amount-bearing lines in source order and take the
-        # final value, which is the per-share cell in that table layout.
+        # PyMuPDF emits the per-share cell interleaved with the minimum and/or
+        # maximum total payout in varying order (e.g. total, per-share or
+        # min total, per-share, max total). A per-share amount is always far
+        # smaller than any company-wide total, so take the smallest value.
         amounts: list[Decimal] = []
         for line in fragment.splitlines():
             money_matches = re.findall(
@@ -228,8 +237,18 @@ def _dividend_per_share_after_label(text: str) -> Decimal | None:
                 if amount is not None:
                     amounts.append(amount)
         if amounts:
-            return amounts[-1]
+            return min(amounts)
     return None
+
+
+def _per_share_currency(text: str) -> str | None:
+    """Return the currency printed directly under the per-share label, if any."""
+    match = re.search(
+        r"(?:dividen per saham|dividend per share)\s*\([^)]*\)\s*(USD|IDR)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return match.group(1).upper() if match else None
 
 
 def _event_from_dividend_schedule(ticker: str, schedule_text: str) -> dict[str, str] | None:
@@ -270,6 +289,12 @@ def _event_from_dividend_schedule(ticker: str, schedule_text: str) -> dict[str, 
         "paymentDate": payment_date,
         "note": note,
     }
+    # CSVs store IDR per share. Issuers sometimes label an IDR amount as USD
+    # (e.g. BSSR "USD 406,1609"), but a sub-unit USD figure is a genuine USD
+    # dividend that would be ~17,000x too small if written as IDR. Mark it so
+    # the IDR equivalent is resolved from KSEI instead of writing it as-is.
+    if _per_share_currency(schedule_text) == "USD" and amount < 1:
+        event["usdDividend"] = event.pop("cashDividend")
     if fiscal_year_match is not None:
         event["fiscalYear"] = fiscal_year_match.group(1)
     return event
@@ -348,15 +373,100 @@ def _announcement_dividend_events(session: Any, impersonate: str) -> list[dict[s
     return events
 
 
+def ksei_idr_dividend(ticker: str, payment_date: str) -> Decimal | None:
+    """Return KSEI's IDR-per-share cash dividend for a ticker's payment date."""
+    import urllib.parse
+    import urllib.request
+
+    query = urllib.parse.urlencode({"locale": "id", "filter[ca_date]": payment_date})
+    request = urllib.request.Request(
+        f"{KSEI_CORPORATE_ACTIONS_URL}?{query}",
+        # The KSEI backend rejects requests that do not ask for JSON.
+        headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        records = json.load(response).get("data") or []
+    for record in records:
+        if (
+            record.get("type_of_ca") == "CASH DIVIDEND"
+            and str(record.get("security_code") or "").upper() == ticker
+            and str(record.get("distribution_date") or "")[:10] == payment_date
+        ):
+            # e.g. "... setiap 1 (satu) saham akan memperoleh Rp 611,93 (...)"
+            match = re.search(r"Rp\.?\s*([0-9][0-9.,]*)", str(record.get("description") or ""))
+            if match:
+                return _decimal_from_idx_text(match.group(1).rstrip(".,"))
+    return None
+
+
+def _event_key(event: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(event.get("code") or "").upper(),
+        str(event.get("exDividend") or ""),
+        str(event.get("note") or "").upper(),
+    )
+
+
+def resolve_usd_events(
+    repo: Path,
+    events: list[dict[str, Any]],
+    idr_lookup: Callable[[str, str], Decimal | None],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Replace USD-denominated events with KSEI's IDR amount once published.
+
+    Unresolved USD events persist in a state file so they are retried on later
+    runs, after the IDX announcement has left the rolling lookback window.
+    Returns the events to sync and the still-pending USD events.
+    """
+    pending_path = repo / PENDING_USD_PATH
+    pending: dict[tuple[str, str, str], dict[str, Any]] = {}
+    if pending_path.exists():
+        for event in json.loads(pending_path.read_text()):
+            pending[_event_key(event)] = event
+
+    synced: list[dict[str, Any]] = []
+    for event in events:
+        if "usdDividend" in event:
+            pending[_event_key(event)] = event
+        else:
+            synced.append(event)
+    if not pending and not pending_path.exists():
+        return synced, []
+
+    still_pending: list[dict[str, Any]] = []
+    cutoff = (date.today() - timedelta(days=PENDING_USD_GRACE_DAYS)).isoformat()
+    for event in pending.values():
+        try:
+            idr_amount = idr_lookup(event["code"], event["paymentDate"])
+        except Exception as exc:
+            print(f"IDX cash-dividend sync: KSEI lookup failed for {event['code']}: {exc}", file=sys.stderr)
+            idr_amount = None
+        if idr_amount is not None:
+            resolved = {key: value for key, value in event.items() if key != "usdDividend"}
+            resolved["cashDividend"] = format(idr_amount, "f")
+            synced.append(resolved)
+        elif event["paymentDate"] >= cutoff:
+            still_pending.append(event)
+        else:
+            print(
+                f"IDX cash-dividend sync: gave up on {event['code']} {event['exDividend']} "
+                f"USD {event['usdDividend']}/share; add the IDR equivalent manually.",
+                file=sys.stderr,
+            )
+
+    if still_pending:
+        pending_path.parent.mkdir(parents=True, exist_ok=True)
+        pending_path.write_text(json.dumps(still_pending, indent=2) + "\n")
+    elif pending_path.exists():
+        pending_path.unlink()
+    return synced, still_pending
+
+
 def _deduplicate_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     unique_events: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for event in events:
-        key = (
-            str(event.get("code") or "").upper(),
-            str(event.get("exDividend") or ""),
-            str(event.get("note") or "").upper(),
-        )
+        key = _event_key(event)
         if key in seen:
             continue
         seen.add(key)
@@ -454,11 +564,16 @@ def fetch_cash_events(session_factory: Callable[[], Any] | None = None) -> list[
     raise RuntimeError("IDX cash-dividend fetch failed; " + "; ".join(failures))
 
 
-def execute(repo: Path, fetcher: Callable[[], list[dict[str, Any]]]) -> dict[str, Any]:
+def execute(
+    repo: Path,
+    fetcher: Callable[[], list[dict[str, Any]]],
+    idr_lookup: Callable[[str, str], Decimal | None] = ksei_idr_dividend,
+) -> dict[str, Any]:
     """Fetch IDX records and synchronize them, returning audit counts."""
     events = list(fetcher())
-    result = sync_cash_events(repo, events)
-    return {"source_rows": len(events), **result}
+    synced, pending_usd = resolve_usd_events(repo, events, idr_lookup)
+    result = sync_cash_events(repo, synced)
+    return {"source_rows": len(events), **result, "pending_usd": pending_usd}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -473,6 +588,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"IDX cash-dividend sync failed: {exc}", file=sys.stderr)
         return 1
 
+    for event in result["pending_usd"]:
+        print(
+            f"IDX cash-dividend sync: {event['code']} {event['exDividend']} is USD "
+            f"{event['usdDividend']}/share; waiting for KSEI's IDR amount.",
+            file=sys.stderr,
+        )
     changed = result["added"] + result["updated"]
     if changed:
         print(
