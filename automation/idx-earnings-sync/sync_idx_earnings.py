@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import shutil
 import sys
 import tempfile
@@ -94,6 +95,15 @@ IMPERSONATE = "chrome124"
 EXTRACTOR_VERSION = 4
 
 
+class Rejected(ValueError):
+    """A filing refused by validation.
+
+    Refusals are data-quality outcomes (missing labels, wrong period, scope
+    mismatch). The filing stays queued and is retried on a later run; they are
+    not failures of the sync itself.
+    """
+
+
 def norm(v):
     return " ".join(str(v or "").strip().lower().split())
 
@@ -157,7 +167,7 @@ def factor_value(v):
         return 1_000_000_000
     if not s:
         return 1
-    raise ValueError(f"unknown rounding unit: {v!r}")
+    raise Rejected(f"unknown rounding unit: {v!r}")
 
 
 def numeric_value(value, multiplier):
@@ -260,7 +270,7 @@ def extract_statement(sheet, multiplier, is_bank):
         required = ("interest_income", "interest_expense", "non_interest", "operating_profit")
         missing = [name for name in required if not bank_seen[name]]
         if missing:
-            raise ValueError(f"missing bank statement components: {', '.join(missing)}")
+            raise Rejected(f"missing bank statement components: {', '.join(missing)}")
         found["revenue"] = (
             bank_interest_income - bank_interest_expense + bank_non_interest,
             "net interest income + non-interest income",
@@ -321,16 +331,16 @@ def extract_workbook(
     )
     end = parse_date(raw_end)
     if expected_ticker and ticker != expected_ticker.upper().replace(".JK", ""):
-        raise ValueError(f"workbook ticker {ticker!r} != {expected_ticker}")
+        raise Rejected(f"workbook ticker {ticker!r} != {expected_ticker}")
     if expected_end and end != expected_end:
-        raise ValueError(f"period end {end} != {expected_end}")
+        raise Rejected(f"period end {end} != {expected_end}")
     start = parse_date(raw_start)
     if start is None:
-        raise ValueError(f"missing or unrecognized period start: {raw_start!r}")
+        raise Rejected(f"missing or unrecognized period start: {raw_start!r}")
     if (start.month, start.day) != (1, 1):
-        raise ValueError(f"period starts {start}, not Jan 1")
+        raise Rejected(f"period starts {start}, not Jan 1")
     if end and start.year != end.year:
-        raise ValueError(f"period start year {start.year} != end year {end.year}")
+        raise Rejected(f"period start year {start.year} != end year {end.year}")
     mult = factor_value(
         meta_value(meta, "pembulatan", "rounding", prefixes=("pembulatan",))
     )
@@ -352,9 +362,9 @@ def extract_workbook(
         if "net_income" in found:
             candidates.append((str(name), found, sources))
     if not ticker or not currency or not end:
-        raise ValueError("missing essential metadata")
+        raise Rejected("missing essential metadata")
     if not candidates:
-        raise ValueError("missing exact parent net income")
+        raise Rejected("missing exact parent net income")
     signatures = {
         tuple(
             candidate[1].get(key, (None, None))[0]
@@ -364,7 +374,7 @@ def extract_workbook(
     }
     if len(signatures) != 1:
         sheets = ", ".join(candidate[0] for candidate in candidates)
-        raise ValueError(f"ambiguous populated statement sheets: {sheets}")
+        raise Rejected(f"ambiguous populated statement sheets: {sheets}")
     statement_sheet, found, sources = candidates[0]
     scope = str(
         meta_value(
@@ -420,7 +430,14 @@ def retry_sleep(seconds, deadline):
     time.sleep(seconds)
 
 
-def discover_all(session, year, period, timeout=20, deadline=None):
+def pace(delay, deadline):
+    """Jittered pause between filings so a long batch stays under IDX's WAF."""
+    if delay <= 0:
+        return
+    retry_sleep(delay * random.uniform(0.7, 1.3), deadline)
+
+
+def discover_all(session, year, period, timeout=20, deadline=None, delay=0):
     all_rows = []
     expected = None
     start = 0
@@ -436,6 +453,8 @@ def discover_all(session, year, period, timeout=20, deadline=None):
             "SortColumn": "File_Modified",
             "SortOrder": "desc",
         }
+        if start:
+            pace(delay, deadline)
         r = None
         for attempt in range(3):
             try:
@@ -450,7 +469,10 @@ def discover_all(session, year, period, timeout=20, deadline=None):
             except Exception:
                 if attempt == 2:
                     raise
-            retry_sleep(1 + attempt * 2, deadline)
+            pause = 1 + attempt * 2
+            if r is not None and r.status_code in {403, 429}:
+                pause = 15 * (attempt + 1)
+            retry_sleep(pause, deadline)
         if r.status_code != 200:
             raise RuntimeError(f"discovery {year}/{period} HTTP {r.status_code}")
         p = r.json()
@@ -580,7 +602,7 @@ def xlsx_from_inline_zip(content):
     if openpyxl is None:
         raise RuntimeError("openpyxl is required")
     if not is_inline_zip(content):
-        raise ValueError("not a supported inline XBRL archive")
+        raise Rejected("not a supported inline XBRL archive")
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
     with zipfile.ZipFile(BytesIO(content)) as archive:
@@ -662,6 +684,181 @@ def atomic_json(path, value):
             os.unlink(tmp)
 
 
+def utc_now():
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def write_progress(path, progress):
+    """Best-effort atomic snapshot so progress is readable mid-run."""
+    progress["updated_at"] = utc_now()
+    try:
+        atomic_json(path, progress)
+    except OSError as e:
+        print(f"progress write failed: {e}", file=sys.stderr)
+
+
+def load_json(path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def local_time(value):
+    if not value:
+        return "unknown"
+    try:
+        return dt.datetime.fromisoformat(value).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def ago(value):
+    try:
+        then = dt.datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return ""
+    if then.tzinfo is None:
+        then = then.astimezone()
+    secs = (dt.datetime.now(dt.timezone.utc) - then).total_seconds()
+    if secs < 0:
+        return "just now"
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size:
+            return f"{int(secs // size)}{unit} ago"
+    return f"{int(secs)}s ago"
+
+
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
+
+
+def lock_held(state_dir):
+    """True/False when determinable, None when locking is unavailable."""
+    try:
+        handle = (state_dir / ".lock").open("a")
+    except OSError:
+        return None
+    try:
+        import fcntl
+
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except (ImportError, OSError):
+        return None
+    finally:
+        handle.close()
+    return False
+
+
+def status_report(state_dir, csv_dir):
+    """Read-only progress report: safe to run while a sync is in flight."""
+    state = load_json(state_dir / "state.json", {})
+    queue = load_json(state_dir / "queue.json", [])
+    progress = load_json(state_dir / "progress.json", None)
+    if not isinstance(state, dict):
+        state = {}
+    if not isinstance(queue, list):
+        queue = []
+    fingerprints = state.get("fingerprints") or {}
+    failures = state.get("failures") or {}
+
+    print("IDX earnings sync")
+    print(f"  state       {state_dir}")
+    if not isinstance(progress, dict):
+        print("  last run    no progress recorded yet (previous script version)")
+    else:
+        status = progress.get("status", "unknown")
+        live = False
+        if status in {"starting", "running"}:
+            if not pid_alive(progress.get("pid")):
+                status = "interrupted (process gone)"
+            else:
+                live = True
+                status = f"{status} (pid {progress.get('pid')}, updated {ago(progress.get('updated_at'))})"
+        stamp = progress.get("finished_at") or progress.get("started_at")
+        print(f"  last run    {status} · {local_time(stamp)}")
+        if progress.get("reason"):
+            print(f"  reason      {progress['reason']}")
+        target = progress.get("target") or 0
+        processed = progress.get("processed") or 0
+        attempted = (
+            processed
+            + (progress.get("rejected") or 0)
+            + (progress.get("errors") or 0)
+        )
+        pct = f" ({attempted * 100 // target}%)" if target else ""
+        print(
+            f"  this run    {attempted}/{target} items{pct} · "
+            f"{progress.get('written', 0)} written · "
+            f"{progress.get('rejected', 0)} refused · "
+            f"{progress.get('errors', 0)} failed"
+        )
+        current = progress.get("current")
+        if isinstance(current, dict):
+            period = PERIOD_NAME.get(current.get("period"), current.get("period"))
+            print(f"  in flight   {current.get('ticker')} {current.get('year')} {period}")
+        print(
+            f"  discovery   {progress.get('discovered', 0):,} filings scanned · "
+            f"{progress.get('remaining', 0):,} left queued at run end"
+        )
+        if live and attempted and target > attempted:
+            elapsed_seconds = progress.get("elapsed_seconds") or 0
+            eta = elapsed_seconds / attempted * (target - attempted)
+            print(f"  eta         ~{int(eta // 60)}m{int(eta % 60):02d}s at current pace")
+    print(f"  queue       {len(queue):,} filings awaiting a retry")
+    print(f"  synced      {len(fingerprints):,} filing keys written")
+    print(f"  flagged     {len(failures):,} filings refused by validation")
+    if failures:
+        counts = {}
+        for item in failures.values():
+            reason = str((item or {}).get("error", "unknown"))
+            counts[reason] = counts.get(reason, 0) + 1
+        top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+        print("  top flags   " + " · ".join(f"{r} ×{n}" for r, n in top))
+    held = lock_held(state_dir)
+    label = {True: "held (sync running)", False: "free", None: "unknown"}[held]
+    print(f"  lock        {label}")
+    try:
+        latest = max(
+            (p.stat().st_mtime for p in Path(csv_dir).glob("*.csv")), default=None
+        )
+    except OSError:
+        latest = None
+    if latest:
+        stamp = dt.datetime.fromtimestamp(latest)
+        print(f"  last write  {stamp.strftime('%Y-%m-%d %H:%M')} ({ago(stamp.isoformat())})")
+    return 0
+
+
+def format_summary(values):
+    head = (
+        f"IDX earnings sync: {values['written']} rows written, "
+        f"{values['rejected']} filings refused, {values['errors']} failures "
+        f"in {values['seconds']:.0f}s — {values['discovered']:,} filings scanned, "
+        f"{values['remaining']:,} left queued"
+    )
+    if values["dry_run"]:
+        head = "IDX earnings sync (dry run): " + head.split(": ", 1)[1]
+    lines = [head]
+    if values["rejected"]:
+        lines.append(
+            "Refused filings stay queued and retry next run; use --status for the flagged reasons."
+        )
+    if values.get("stopped_early"):
+        lines.append(
+            f"Time budget reached before the queue drained; {values['remaining']:,} filings remain queued."
+        )
+    if values["errors"]:
+        lines.append("Failures were infrastructure/extraction errors; the exit code stays non-zero.")
+    return "\n".join(lines)
+
+
 def fingerprint(report):
     return hashlib.sha256(
         json.dumps(report, sort_keys=True, default=str).encode()
@@ -675,16 +872,19 @@ def cache_path(cache, year, period, ticker, fp):
 def fetch(session, url, timeout=120, deadline=None):
     last = None
     for i in range(3):
+        pause = 1 + i
         try:
             last = session.get(
                 url, impersonate=IMPERSONATE, timeout=request_timeout(timeout, deadline)
             )
             if last.status_code not in RETRY or i == 2:
                 return last
+            # A thumbprint/WAF refusal needs a real cooldown, not a token retry.
+            pause = 15 * (i + 1) if last.status_code in {403, 429} else 1 + i
         except Exception:
             if i == 2:
                 raise
-        retry_sleep(1 + i, deadline)
+        retry_sleep(pause, deadline)
     return last
 
 
@@ -745,6 +945,8 @@ def report_workbook(session, report, cache_dir, year, period, ticker, fp, deadli
                 session, fallback, inline_path, 120, deadline
             )
             return xlsx_from_inline_zip(content), fallback, inline_path
+        except Rejected:
+            raise
         except Exception as inline_error:
             raise RuntimeError(
                 f"{xlsx_error}; inline XBRL fallback failed: {inline_error}"
@@ -779,13 +981,33 @@ def main(argv=None):
         default=20,
         help="per-request timeout within the time budget",
     )
+    ap.add_argument(
+        "--all",
+        action="store_true",
+        help="process every eligible queued filing (overrides --max-items)",
+    )
+    ap.add_argument(
+        "--delay",
+        type=float,
+        default=0.0,
+        help="seconds to pause between filings (jittered ±30%%) to avoid provider throttling",
+    )
+    ap.add_argument(
+        "--status",
+        action="store_true",
+        help="print sync progress without touching the network and exit",
+    )
     a = ap.parse_args(argv)
+    if a.status:
+        return status_report(a.state_dir, a.csv_dir)
     if a.max_items < 0:
         ap.error("--max-items must be non-negative")
     if a.max_seconds <= 0:
         ap.error("--max-seconds must be positive")
     if a.timeout <= 0:
         ap.error("--timeout must be positive")
+    if a.delay < 0:
+        ap.error("--delay must be non-negative")
 
     deadline = time.monotonic() + a.max_seconds
     periods_to_discover = discovery_periods(a.period)
@@ -813,6 +1035,32 @@ def main(argv=None):
 
     a.state_dir.mkdir(parents=True, exist_ok=True)
     a.cache_dir.mkdir(parents=True, exist_ok=True)
+    progress_path = a.state_dir / "progress.json"
+    started_monotonic = time.monotonic()
+    started_at = utc_now()
+    progress = {
+        "pid": os.getpid(),
+        "run_id": started_at,
+        "started_at": started_at,
+        "status": "starting",
+        "processed": 0,
+        "written": 0,
+        "rejected": 0,
+        "errors": 0,
+        "discovered": 0,
+        "queued": 0,
+        "target": 0,
+        "current": None,
+        "reason": None,
+        "remaining": 0,
+    }
+
+    def save_progress(**updates):
+        progress.update(updates)
+        progress["elapsed_seconds"] = round(time.monotonic() - started_monotonic, 1)
+        write_progress(progress_path, progress)
+
+    save_progress()
     state_path = a.state_dir / "state.json"
     queue_path = a.state_dir / "queue.json"
     prov_path = a.state_dir / "provenance.json"
@@ -824,6 +1072,7 @@ def main(argv=None):
             fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             print("another sync is running", file=sys.stderr)
+            save_progress(status="failed", reason="another sync is already running")
             return 3
         except ImportError:
             print("advisory file locking is unavailable", file=sys.stderr)
@@ -852,6 +1101,7 @@ def main(argv=None):
             )
         except (OSError, json.JSONDecodeError) as e:
             print(f"failed to read sync state: {e}", file=sys.stderr)
+            save_progress(status="failed", reason=f"unreadable sync state: {e}")
             return 2
         if (
             not isinstance(state, dict)
@@ -890,6 +1140,7 @@ def main(argv=None):
                 pass
         if not warmed:
             print("IDX homepage warm-up failed", file=sys.stderr)
+            save_progress(status="failed", reason="IDX homepage warm-up failed")
             return 2
 
         reports = {}
@@ -898,7 +1149,9 @@ def main(argv=None):
                 for p in periods_to_discover:
                     if period_date(y, p) > today:
                         continue
-                    for report in discover_all(session, y, p, a.timeout, deadline):
+                    for report in discover_all(
+                        session, y, p, a.timeout, deadline, a.delay
+                    ):
                         t = (
                             str(report.get("KodeEmiten", ""))
                             .strip()
@@ -915,6 +1168,7 @@ def main(argv=None):
                             reports[report_key] = report
         except Exception as e:
             print(f"discovery failed: {e}", file=sys.stderr)
+            save_progress(status="failed", reason=f"discovery failed: {e}")
             return 2
 
         active_keys = {f"{t}:{y}:{p}" for t, y, p in reports}
@@ -1015,16 +1269,28 @@ def main(argv=None):
             )
         )
         eligible = [q for q in queue if q["key"] in active_keys]
+        limit = len(eligible) if a.all else a.max_items
         processed = 0
         changed = 0
+        rejected = 0
         errors = 0
         successful_keys = set()
+        save_progress(
+            status="running",
+            discovered=len(reports),
+            queued=len(queue),
+            target=limit,
+            remaining=len(eligible),
+        )
 
-        for item in eligible[: a.max_items]:
+        budget_exhausted = False
+        for item in eligible[:limit]:
             if time.monotonic() >= deadline:
+                budget_exhausted = True
                 break
             t, y, p = item["ticker"], item["year"], item["period"]
             key = item["key"]
+            save_progress(current={"key": key, "ticker": t, "year": y, "period": p})
             try:
                 report = reports[(t, y, p)]
                 source_fp = fingerprint(report)
@@ -1040,7 +1306,7 @@ def main(argv=None):
                 if pp:
                     prior = reports.get((t, y, pp))
                     if not prior:
-                        raise RuntimeError(f"missing dependency {pp}")
+                        raise Rejected(f"missing dependency {pp}")
                     pfp = fingerprint(prior)
                     previous_content, pa, _ = report_workbook(
                         session, prior, a.cache_dir, y, pp, t, pfp, deadline
@@ -1051,7 +1317,7 @@ def main(argv=None):
                         period_date(y, pp),
                     )
                     if prev["currency"] != cur["currency"]:
-                        raise RuntimeError(
+                        raise Rejected(
                             f"currency mismatch {prev['currency']} -> {cur['currency']}"
                         )
                     if (
@@ -1059,10 +1325,10 @@ def main(argv=None):
                         and cur.get("scope")
                         and norm(prev["scope"]) != norm(cur["scope"])
                     ):
-                        raise RuntimeError("consolidated/single-entity scope mismatch")
+                        raise Rejected("consolidated/single-entity scope mismatch")
                 vals = cur if p == "tw1" else standalone(cur, prev)
                 if vals is None:
-                    raise RuntimeError("cumulative dependency unavailable")
+                    raise Rejected("cumulative dependency unavailable")
                 row = {
                     "date": str(period_date(y, p)),
                     "symbol": t,
@@ -1091,7 +1357,7 @@ def main(argv=None):
                         and old.get("period") == PERIOD_NAME[p]
                         and old.get("date") != row["date"]
                     ):
-                        raise RuntimeError(
+                        raise Rejected(
                             f"existing noncanonical date {old['date']} for {t} {y} {PERIOD_NAME[p]}"
                         )
                 warning = sorted(
@@ -1128,33 +1394,67 @@ def main(argv=None):
                 successful_keys.add(key)
                 processed += 1
                 changed += 0 if a.dry_run else 1
+            except Rejected as e:
+                if not a.dry_run:
+                    state["failures"][key] = {
+                        "error": str(e),
+                        "kind": "rejected",
+                        "at": utc_now(),
+                    }
+                rejected += 1
             except Exception as e:
                 if not a.dry_run:
                     state["failures"][key] = {
                         "error": str(e),
-                        "at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        "kind": "error",
+                        "at": utc_now(),
                     }
                 errors += 1
+            save_progress(
+                processed=processed,
+                written=changed,
+                rejected=rejected,
+                errors=errors,
+                current=None,
+            )
+            try:
+                pace(a.delay, deadline)
+            except TimeoutError:
+                budget_exhausted = True
+                break
 
         remaining = [q for q in queue if a.dry_run or q["key"] not in successful_keys]
         if not a.dry_run:
             atomic_json(queue_path, remaining)
             atomic_json(state_path, state)
             atomic_json(prov_path, prov)
+        elapsed = time.monotonic() - started_monotonic
+        save_progress(
+            status="completed",
+            finished_at=utc_now(),
+            processed=processed,
+            written=changed,
+            rejected=rejected,
+            errors=errors,
+            remaining=len(remaining),
+            current=None,
+        )
         print(
-            json.dumps(
+            format_summary(
                 {
-                    "discovered": len(reports),
-                    "queued": len(queue),
-                    "processed": processed,
-                    "changed": changed,
+                    "written": changed,
+                    "rejected": rejected,
                     "errors": errors,
+                    "seconds": elapsed,
+                    "discovered": len(reports),
                     "remaining": len(remaining),
+                    "stopped_early": budget_exhausted,
                     "dry_run": a.dry_run,
-                },
-                sort_keys=True,
+                }
             )
         )
+        # Refusals are expected data-quality outcomes; only real failures
+        # should make the scheduled job look broken.
         return 1 if errors else 0
     finally:
         lock_file.close()
